@@ -1,155 +1,132 @@
 import pandas as pd
-from sqlalchemy import create_engine, text, Date, cast
-from sqlalchemy.orm import sessionmaker
+from pymongo import MongoClient, UpdateOne
 from datetime import datetime, timedelta, date
 import logging
-import sys # Para manejar errores en la inicialización
+import sys
 
-# --- CONFIGURACIÓN (¡IMPORTANTE! DEBES AJUSTAR ESTO) ---
+# --- CONFIGURACIÓN ---
+MONGO_URI = "mongodb://localhost:27017/"
+DB_NAME = "produccion_db"
 
-# 1. Conexión a tu base de datos PostgreSQL
-DATABASE_URL = "postgresql://postgres:admin@localhost:5432/postgres"
-
-# 2. Lógica de Negocio (Tus Reglas)
 CAPACIDAD_DIARIA_DEFAULT = 180000.00
-UMBRAL_CIERRE_DIA = 165000.00 # Si se llega a esto, se pasa al sig. día
-VENTANA_DIAS_ENTREGA = 2 # Lunes considera hasta Miércoles (2 días)
-DIAS_REPORTE_FUTUROS = 5 # El número de barras/días a mostrar (Lun-Vie)
+UMBRAL_CIERRE_DIA = 165000.00 
+VENTANA_DIAS_ENTREGA = 2 
+DIAS_REPORTE_FUTUROS = 5 
 
-# 3. Estatus que entran en la programación
+# Estatus que consideramos "pendientes" para programar si no tienen fecha
 ESTATUS_A_PROGRAMAR = [
     'SIN PROGRAMAR',
     'INGRESADO SIN PROGRAMAR',
     'PROGRAMADO PARCIAL',
     'SIN FABRICAR',
-    'INGRESO' # El estatus de los datos crudos
+    'INGRESO' 
 ]
-# -----------------------------------------------------------------
 
-# Configuración de logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Configuración de la Base de Datos
-try:
-    engine = create_engine(DATABASE_URL, connect_args={'client_encoding': 'latin1'})
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    logging.info("Motor de base de datos creado.")
-except Exception as e:
-    logging.error(f"Error fatal al crear el engine de BD: {e}")
-    sys.exit(1) # Detiene el script si no se puede conectar
-
-
-def obtener_reglas_calendario(session) -> dict:
-    """Obtiene las reglas de capacidad y días festivos de la BD."""
-    logging.info("Obteniendo reglas del calendario...")
-    query = "SELECT fecha, es_laboral, capacidad_m2 FROM calendario"
+# --- HELPERS ---
+def limpiar_op(valor):
+    if pd.isna(valor) or str(valor).strip() == '':
+        return None
     try:
-        resultado = session.execute(text(query)).fetchall()
-        # Convertimos la lista de tuplas en un diccionario para acceso rápido
-        # ej: {'2025-11-07': (True, 400000.00), ...}
-        reglas = {row[0]: (row[1], float(row[2])) for row in resultado}
-        logging.info(f"Se cargaron {len(reglas)} reglas especiales del calendario.")
+        val_float = float(valor)
+        val_int = int(val_float)
+        return str(val_int)
+    except ValueError:
+        return str(valor).strip()
+
+def obtener_db():
+    try:
+        client = MongoClient(MONGO_URI)
+        return client[DB_NAME]
+    except Exception as e:
+        logging.error(f"Error fatal al conectar a Mongo: {e}")
+        sys.exit(1)
+
+def obtener_reglas_calendario(db) -> dict:
+    logging.info("Obteniendo reglas del calendario...")
+    try:
+        cursor = db.calendario.find({})
+        reglas = {}
+        for doc in cursor:
+            fecha_val = doc.get('fecha')
+            if isinstance(fecha_val, datetime):
+                fecha_key = fecha_val.date()
+            else:
+                fecha_key = pd.to_datetime(fecha_val).date()
+            reglas[fecha_key] = (
+                doc.get('es_laboral', True), 
+                float(doc.get('capacidad_m2', CAPACIDAD_DIARIA_DEFAULT))
+            )
         return reglas
     except Exception as e:
         logging.error(f"Error al obtener calendario: {e}")
         return {}
 
-def obtener_pedidos_para_programar(session) -> pd.DataFrame:
-    """Obtiene los pedidos pendientes y los ordena por FIFO."""
-    logging.info("Obteniendo pedidos pendientes de la BD...")
+# --- PASO 1: OBTENER SOLO LO NUEVO ---
+def obtener_pedidos_para_programar(db) -> pd.DataFrame:
+    logging.info("Obteniendo pedidos pendientes (sin fecha asignada)...")
     try:
-        query = text(f"""
-            SELECT op, metros2_pedido, fecha_ingreso, fecha_entrega
-            FROM pedidos
-            WHERE 
-                fecha_programacion_asignada IS NULL
-            AND 
-                estatus_excel IN :estatus_validos
-            AND 
-                bloqueado = FALSE
-            ORDER BY 
-                prioridad ASC, fecha_ingreso ASC;
-        """)
+        # El filtro CLAVE: Solo traemos lo que tiene fecha_programacion_asignada: null
+        filtro = {
+            "fecha_programacion_asignada": None, 
+            "ESTATUS_EXCEL": {"$in": ESTATUS_A_PROGRAMAR}, 
+            "bloqueado": {"$ne": True} 
+        }
+        proyeccion = {
+            "OP": 1, "M2": 1, "FECHA_INGRESO": 1, "FECHA_ENTREGA": 1, "_id": 0, "prioridad": 1 
+        }
+        cursor = db.pedidos.find(filtro, proyeccion).sort([("prioridad", 1), ("FECHA_INGRESO", 1)])
+        df_pedidos = pd.DataFrame(list(cursor))
         
-        df_pedidos = pd.read_sql(query, session.connection(), params={"estatus_validos": tuple(ESTATUS_A_PROGRAMAR)})
-        
-        # Convertir tipos
-        df_pedidos['metros2_pedido'] = pd.to_numeric(df_pedidos['metros2_pedido'], errors='coerce').fillna(0)
-        df_pedidos['fecha_ingreso'] = pd.to_datetime(df_pedidos['fecha_ingreso'])
-        df_pedidos['fecha_entrega'] = pd.to_datetime(df_pedidos['fecha_entrega'])
-        
-        logging.info(f"Se encontraron {len(df_pedidos)} pedidos para programar.")
+        if not df_pedidos.empty:
+            df_pedidos['M2'] = pd.to_numeric(df_pedidos['M2'], errors='coerce').fillna(0.0)
+            df_pedidos['FECHA_INGRESO'] = pd.to_datetime(df_pedidos['FECHA_INGRESO'])
+            df_pedidos['FECHA_ENTREGA'] = pd.to_datetime(df_pedidos['FECHA_ENTREGA'])
+            df_pedidos['OP'] = df_pedidos['OP'].apply(limpiar_op)
+            
+        logging.info(f"Se encontraron {len(df_pedidos)} pedidos NUEVOS para programar.")
         return df_pedidos
     except Exception as e:
         logging.error(f"Error al obtener pedidos: {e}")
         return pd.DataFrame()
 
-
+# --- LÓGICA DE FECHAS ---
 def obtener_proximo_dia_habil(fecha_actual: date, reglas_calendario: dict) -> date:
-    """Encuentra el próximo día laborable según las reglas."""
     siguiente_dia = fecha_actual + timedelta(days=1)
-    
     while True:
         if siguiente_dia in reglas_calendario:
             es_laboral, _ = reglas_calendario[siguiente_dia]
-            if es_laboral:
-                return siguiente_dia # Es un día especial pero es laboral
+            if es_laboral: return siguiente_dia 
         else:
-            # Si no está en reglas, aplicar lógica de fin de semana
-            # Lunes=0, Domingo=6
-            if siguiente_dia.weekday() < 5: # 0-4 son Lunes a Viernes
-                return siguiente_dia # Es un día de semana normal
-        
-        # Si no fue un día hábil, probamos con el siguiente
+            if siguiente_dia.weekday() < 5: return siguiente_dia 
         siguiente_dia += timedelta(days=1)
 
 def calcular_dias_reporte(reglas_calendario: dict) -> (list, date):
-    """Calcula los 5 días del reporte y la fecha de "Posteriores"."""
     dias_reporte = []
-    
-    # Empezamos desde hoy
     dia_actual = datetime.now().date()
     
-    # Si hoy es Sábado (5) o Domingo (6), empezamos desde el próximo Lunes
     if dia_actual.weekday() >= 5:
         dia_actual = obtener_proximo_dia_habil(dia_actual, reglas_calendario)
-    
-    # Verificamos si hoy (ej. Miércoles) es hábil
-    if dia_actual in reglas_calendario:
-        es_laboral, _ = reglas_calendario[dia_actual]
-        if not es_laboral:
-            dia_actual = obtener_proximo_dia_habil(dia_actual, reglas_calendario)
-    
-    # Llenamos los 5 días del reporte
+        
     dias_reporte.append(dia_actual)
     while len(dias_reporte) < DIAS_REPORTE_FUTUROS:
         dia_actual = obtener_proximo_dia_habil(dia_actual, reglas_calendario)
         dias_reporte.append(dia_actual)
     
-    # La fecha "Posteriores" es el siguiente día hábil después del último día
     fecha_posteriores = obtener_proximo_dia_habil(dias_reporte[-1], reglas_calendario)
-    
-    logging.info(f"Días de reporte calculados: {dias_reporte}")
-    logging.info(f"Fecha de 'Posteriores' calculada: {fecha_posteriores}")
-    
     return dias_reporte, fecha_posteriores
 
-
 def calcular_fecha_limite_entrega(fecha_programacion: date, reglas_calendario: dict) -> date:
-    """Calcula la ventana de entrega de 2 días hábiles (regla Viernes->Martes)."""
     dia_semana_prog = fecha_programacion.weekday()
-    
-    # Regla especial del Viernes (4) -> salta a Martes (1)
-    if dia_semana_prog == 4: # Si estamos programando para un VIERNES
-        fecha_limite = fecha_programacion + timedelta(days=4) # Martes
-        # Nos aseguramos que ese martes sea hábil
+    if dia_semana_prog == 4: 
+        fecha_limite = fecha_programacion + timedelta(days=4) 
         if fecha_limite in reglas_calendario:
              es_laboral, _ = reglas_calendario[fecha_limite]
              if not es_laboral:
                  fecha_limite = obtener_proximo_dia_habil(fecha_limite, reglas_calendario)
         return fecha_limite
 
-    # Regla normal (Lunes a Jueves)
     dias_a_sumar = 0
     dia_actual = fecha_programacion
     while dias_a_sumar < VENTANA_DIAS_ENTREGA:
@@ -157,216 +134,213 @@ def calcular_fecha_limite_entrega(fecha_programacion: date, reglas_calendario: d
         dias_a_sumar += 1
     return dia_actual
 
+# --- PASO 2: CALCULAR CARGA EXISTENTE (RESPETAR AL USUARIO) ---
+def calcular_carga_previa(db, dias_reporte, fecha_posteriores):
+    """
+    Suma los M2 de pedidos que YA tienen fecha asignada en la BD.
+    Esto incluye lo que el usuario movió manualmente (candados) y lo que ya se programó antes.
+    """
+    logging.info("Calculando carga ocupada por pedidos existentes...")
+    capacidad_usada = {dia: 0.0 for dia in dias_reporte}
+    capacidad_usada[fecha_posteriores] = 0.0
+    
+    # Buscamos todo lo que NO es nulo en fecha
+    cursor = db.pedidos.find(
+        {"fecha_programacion_asignada": {"$ne": None}}, 
+        {"fecha_programacion_asignada": 1, "M2": 1}
+    )
+    
+    for doc in cursor:
+        fecha = doc.get("fecha_programacion_asignada")
+        m2 = doc.get("M2", 0.0)
+        
+        if isinstance(fecha, datetime):
+            fecha_date = fecha.date()
+            if fecha_date in capacidad_usada:
+                capacidad_usada[fecha_date] += m2
+            elif fecha_date > dias_reporte[-1]:
+                capacidad_usada[fecha_posteriores] += m2
+                
+    return capacidad_usada
 
-def ejecutar_motor_programacion(session, df_pedidos, reglas_calendario):
-    """Asigna fechas de programación a los pedidos usando la lógica de 5 días + posteriores."""
-    logging.info("Iniciando motor de programación (v2.0)...")
-    
+# --- PASO 3: MOTOR DE PROGRAMACIÓN INTELIGENTE ---
+def ejecutar_motor_programacion(db, df_pedidos, reglas_calendario):
+    logging.info("Iniciando motor de programación...")
     dias_reporte, fecha_posteriores = calcular_dias_reporte(reglas_calendario)
-    
-    # Diccionario para guardar las actualizaciones: {'OP-123': date(2025, 11, 4), ...}
     actualizaciones_fechas = {}
     
-    # Diccionario para llevar la cuenta de la capacidad usada por día
-    # {date(2025, 11, 3): 150000, ...}
-    capacidad_usada_por_dia = {dia: 0.0 for dia in dias_reporte}
-    capacidad_usada_por_dia[fecha_posteriores] = 0.0 # Capacidad ilimitada
+    # AQUI ESTA LA MAGIA: Iniciamos con el vaso medio lleno, no vacío
+    capacidad_usada_por_dia = calcular_carga_previa(db, dias_reporte, fecha_posteriores)
+    
+    dia_programacion_actual = dias_reporte[0]
 
-    # Empezamos a programar desde el primer día del reporte
-    dia_programacion_actual = dias_reporte[0] # Ej. Lunes
+    # Avanzamos el día actual si ya está lleno por movimientos manuales previos
+    while True:
+        if dia_programacion_actual == fecha_posteriores: break
+        
+        regla = reglas_calendario.get(dia_programacion_actual)
+        cap_total = regla[1] if regla else CAPACIDAD_DIARIA_DEFAULT
+        usado = capacidad_usada_por_dia.get(dia_programacion_actual, 0)
+        
+        if usado >= UMBRAL_CIERRE_DIA:
+            logging.info(f"Día {dia_programacion_actual} ya saturado ({usado:,.0f} m²). Buscando hueco en siguiente día...")
+            nuevo_dia = obtener_proximo_dia_habil(dia_programacion_actual, reglas_calendario)
+            if nuevo_dia not in dias_reporte:
+                dia_programacion_actual = fecha_posteriores
+                break
+            dia_programacion_actual = nuevo_dia
+        else:
+            break
 
-    # --- Bucle principal de asignación ---
+    # Asignamos los pedidos NUEVOS en los huecos libres
     for _, pedido in df_pedidos.iterrows():
-        op = pedido['op']
-        m2 = pedido['metros2_pedido']
+        op = pedido['OP'] 
+        m2 = pedido['M2'] 
         
         dia_asignado = None
         dia_a_probar = dia_programacion_actual
         
-        # --- Bucle interno: Encontrar un día para este pedido ---
         while True: 
-            # Obtenemos la capacidad del día a probar
+            # Si llegamos a posteriores, ahí se queda
+            if dia_a_probar == fecha_posteriores:
+                dia_asignado = fecha_posteriores
+                break
+                
             regla_dia = reglas_calendario.get(dia_a_probar)
             capacidad_dia = regla_dia[1] if regla_dia else CAPACIDAD_DIARIA_DEFAULT
-            
-            # Obtenemos el uso actual de ese día
             uso_actual_dia = capacidad_usada_por_dia.get(dia_a_probar, 0)
             
-            # Calculamos la fecha límite de entrega para esta "ventana"
+            # Validar fecha entrega (Business Logic)
             fecha_limite_ent = calcular_fecha_limite_entrega(dia_a_probar, reglas_calendario)
-
-            # --- APLICACIÓN DE LÓGICA DE NEGOCIO ---
-
-            # 1. ¿El pedido está en la ventana de entrega permitida?
-            if pedido['fecha_entrega'].date() > fecha_limite_ent:
-                # No. La fecha de entrega de este pedido es muy lejana para esta ventana.
-                # Avanzamos la *ventana* al próximo día hábil.
+            if pedido['FECHA_ENTREGA'].date() > fecha_limite_ent:
                 dia_a_probar = obtener_proximo_dia_habil(dia_a_probar, reglas_calendario)
-                continue # Re-evaluamos el mismo pedido con la nueva ventana
-
-            # 2. ¿El pedido cabe en la CAPACIDAD TOTAL del día a probar?
-            if (uso_actual_dia + m2) <= capacidad_dia:
-                # ¡Sí cabe!
-                dia_asignado = dia_a_probar
-                break # Salimos del bucle interno, ya encontramos día
-            else:
-                # No cabe. Este día está lleno.
-                # Avanzamos al *próximo día hábil* para intentar meterlo ahí.
-                dia_a_probar = obtener_proximo_dia_habil(dia_a_probar, reglas_calendario)
-                continue # Re-evaluamos el mismo pedido en el nuevo día
-        
-        # --- Fin del bucle interno: Asignar el pedido ---
-        
-        # Si el día asignado está fuera de los 5 días, lo mandamos a "Posteriores"
-        if dia_asignado not in dias_reporte:
-            dia_asignado_final = fecha_posteriores
-        else:
-            dia_asignado_final = dia_asignado
+                if dia_a_probar not in dias_reporte: dia_a_probar = fecha_posteriores
+                continue 
             
-        # Registramos la asignación
-        actualizaciones_fechas[op] = dia_asignado_final
-        capacidad_usada_por_dia[dia_asignado_final] += m2
+            # Validar capacidad (Respetando lo manual)
+            if (uso_actual_dia + m2) <= capacidad_dia:
+                dia_asignado = dia_a_probar
+                break 
+            else:
+                dia_a_probar = obtener_proximo_dia_habil(dia_a_probar, reglas_calendario)
+                if dia_a_probar not in dias_reporte: dia_a_probar = fecha_posteriores
+                continue 
+        
+        actualizaciones_fechas[op] = dia_asignado
+        capacidad_usada_por_dia[dia_asignado] += m2
 
-        # 3. ¿El día asignado (no "Posteriores") superó el UMBRAL de cierre?
-        if dia_asignado_final != fecha_posteriores and capacidad_usada_por_dia[dia_asignado_final] >= UMBRAL_CIERRE_DIA:
-            # Sí. El próximo pedido debe empezar a buscar desde el *siguiente* día.
-            dia_programacion_actual = obtener_proximo_dia_habil(dia_asignado_final, reglas_calendario)
+        # Si llenamos el día actual con automáticos, avanzamos
+        if dia_asignado == dia_programacion_actual and dia_asignado != fecha_posteriores:
+             if capacidad_usada_por_dia[dia_asignado] >= UMBRAL_CIERRE_DIA:
+                nuevo_dia = obtener_proximo_dia_habil(dia_asignado, reglas_calendario)
+                if nuevo_dia in dias_reporte:
+                    dia_programacion_actual = nuevo_dia
+                else:
+                    dia_programacion_actual = fecha_posteriores
 
-    logging.info(f"Motor finalizado. Se asignaron fechas a {len(actualizaciones_fechas)} pedidos.")
     return actualizaciones_fechas, capacidad_usada_por_dia, dias_reporte, fecha_posteriores
 
-
-def actualizar_base_datos(session, actualizaciones_fechas: dict):
-    """Actualiza la tabla 'pedidos' con las fechas calculadas."""
-    if not actualizaciones_fechas:
-        logging.info("No hay actualizaciones de fechas para aplicar.")
-        return
-
-    logging.info(f"Actualizando {len(actualizaciones_fechas)} pedidos en la BD...")
+def actualizar_base_datos(db, actualizaciones_fechas: dict):
+    if not actualizaciones_fechas: return
+    logging.info(f"Guardando fechas de {len(actualizaciones_fechas)} pedidos nuevos...")
     try:
-        # Convertimos el diccionario a una lista de tuplas para el DF
-        data_list = [{'op': op, 'fecha_prog_new': fecha} for op, fecha in actualizaciones_fechas.items()]
-        df_updates = pd.DataFrame(data_list)
+        operations = []
+        for op, fecha_date in actualizaciones_fechas.items():
+            fecha_iso = datetime.combine(fecha_date, datetime.min.time())
+            op_limpia = limpiar_op(op)
+            # Solo actualizamos la fecha, NO ponemos candado (fijo_usuario) porque es automático
+            operations.append(UpdateOne({"OP": op_limpia}, {"$set": {"fecha_programacion_asignada": fecha_iso}}))
         
-        # 2. Cargar a tabla temporal
-        temp_table_name = "temp_fechas_prog"
-        df_updates.to_sql(temp_table_name, session.connection(), if_exists='replace', index=False)
-        
-        # 3. Ejecutar UPDATE JOIN
-        update_query = text(f"""
-            UPDATE pedidos
-            SET fecha_programacion_asignada = T.fecha_prog_new
-            FROM {temp_table_name} AS T
-            WHERE pedidos.op = T.op;
-        """)
-        session.execute(update_query)
-        
-        # 4. Borrar tabla temporal
-        session.execute(text(f"DROP TABLE {temp_table_name}"))
-        
-        logging.info("Fechas de programación actualizadas en tabla 'pedidos'.")
-        
+        if operations:
+            result = db.pedidos.bulk_write(operations)
+            logging.info(f"Fechas asignadas automáticamente: {result.modified_count}")
     except Exception as e:
-        logging.error(f"Error al actualizar fechas de pedidos: {e}")
-        raise # Propagamos el error
+        logging.error(f"Error al actualizar MongoDB: {e}")
+        raise 
 
-
-def actualizar_reporte_capacidad(session, reglas_calendario, capacidad_usada, dias_reporte, fecha_posteriores):
-    """Recalcula y actualiza la tabla 'reporte_capacidad_diaria'."""
-    logging.info("Actualizando tabla 'reporte_capacidad_diaria'...")
+def actualizar_reporte_capacidad(db, reglas_calendario, capacidad_usada, dias_reporte, fecha_posteriores):
+    logging.info("Regenerando reporte de capacidad (agregando lo manual + automático)...")
     try:
-        # 1. Borramos el reporte viejo
-        session.execute(text("TRUNCATE TABLE reporte_capacidad_diaria"))
-        
-        # No consultamos la BD, usamos los datos que ya calculamos
-        
-        # 3. Preparamos los datos para insertar (los 5 días)
+        db.reporte_capacidad_diaria.delete_many({})
         datos_reporte = []
+        
+        # Hacemos una agregación DIRECTA en base de datos para tener la verdad absoluta
+        # (Suma lo que acabamos de guardar + lo que ya existía)
         for fecha in dias_reporte:
             regla = reglas_calendario.get(fecha)
             cap_total = regla[1] if regla else CAPACIDAD_DIARIA_DEFAULT
-            m2_usados = capacidad_usada.get(fecha, 0.0)
-            m2_disponibles = cap_total - m2_usados
             
-            # Contamos los pedidos de ese día
-            count_query = text("SELECT COUNT(op) FROM pedidos WHERE fecha_programacion_asignada = :fecha")
-            num_pedidos = session.execute(count_query, {"fecha": fecha}).scalar_one()
-
-            datos_reporte.append({
-                "fecha": fecha,
-                "capacidad_total_m2": cap_total,
-                "m2_utilizados": m2_usados,
-                "m2_disponibles": m2_disponibles,
-                "conteo_pedidos": num_pedidos
-            })
+            fecha_iso = datetime.combine(fecha, datetime.min.time())
             
-        # 4. Añadimos la barra "Posteriores"
-        m2_usados_post = capacidad_usada.get(fecha_posteriores, 0.0)
-        if m2_usados_post > 0:
-            count_query_post = text("SELECT COUNT(op) FROM pedidos WHERE fecha_programacion_asignada = :fecha")
-            num_pedidos_post = session.execute(count_query_post, {"fecha": fecha_posteriores}).scalar_one()
+            pipeline = [
+                {"$match": {"fecha_programacion_asignada": fecha_iso}},
+                {"$group": {"_id": None, "total_m2": {"$sum": "$M2"}, "conteo": {"$sum": 1}}}
+            ]
+            res = list(db.pedidos.aggregate(pipeline))
+            m2_reales = res[0]['total_m2'] if res else 0.0
+            conteo = res[0]['conteo'] if res else 0
             
             datos_reporte.append({
-                "fecha": fecha_posteriores,
-                "capacidad_total_m2": m2_usados_post, # Capacidad total = m2 usados
-                "m2_utilizados": m2_usados_post,
-                "m2_disponibles": 0.0, # Siempre está "lleno"
-                "conteo_pedidos": num_pedidos_post
+                "fecha": fecha_iso, 
+                "capacidad_total_m2": cap_total, 
+                "m2_utilizados": m2_reales, 
+                "m2_disponibles": cap_total - m2_reales, 
+                "conteo_pedidos": conteo
+            })
+            
+        # Calcular "Posteriores" (Todo lo que cae después del horizonte visible)
+        fecha_limite_horizonte = datetime.combine(dias_reporte[-1], datetime.max.time())
+        
+        pipeline_post = [
+             {"$match": {"fecha_programacion_asignada": {"$gt": fecha_limite_horizonte}}},
+             {"$group": {"_id": None, "total_m2": {"$sum": "$M2"}, "conteo": {"$sum": 1}}}
+        ]
+        res_post = list(db.pedidos.aggregate(pipeline_post))
+        m2_post = res_post[0]['total_m2'] if res_post else 0.0
+        conteo_post = res_post[0]['conteo'] if res_post else 0
+        
+        if m2_post > 0:
+            # Guardamos "Posteriores" con la fecha real del objeto fecha_posteriores
+            # El backend (main.py) se encargará de agruparlo visualmente si es necesario
+            fecha_post_obj = datetime.combine(fecha_posteriores, datetime.min.time())
+            
+            datos_reporte.append({
+                "fecha": fecha_post_obj, 
+                "capacidad_total_m2": m2_post, 
+                "m2_utilizados": m2_post, 
+                "m2_disponibles": 0.0, 
+                "conteo_pedidos": conteo_post
             })
 
-        # 5. Insertamos los nuevos datos del reporte
         if datos_reporte:
-            insert_query = text("""
-                INSERT INTO reporte_capacidad_diaria (fecha, capacidad_total_m2, m2_utilizados, m2_disponibles, conteo_pedidos)
-                VALUES (:fecha, :capacidad_total_m2, :m2_utilizados, :m2_disponibles, :conteo_pedidos)
-            """)
-            session.execute(insert_query, datos_reporte)
-        
-        logging.info(f"Tabla 'reporte_capacidad_diaria' actualizada con {len(datos_reporte)} barras (días + posteriores).")
-        
+            db.reporte_capacidad_diaria.insert_many(datos_reporte)
+        logging.info("Reporte actualizado correctamente.")
     except Exception as e:
-        logging.error(f"Error al actualizar el reporte de capacidad: {e}")
-        raise # Propagamos el error
-
+        logging.error(f"Error al actualizar el reporte: {e}")
+        raise 
 
 def main():
-    """Flujo principal del Motor de Programación."""
-    logging.info("--- Iniciando Motor de Programación (v2.0 - 5 Días + Posteriores) ---")
-    session = SessionLocal()
-    
+    logging.info("--- Iniciando Scheduler Inteligente (Modo Respeto) ---")
+    db = obtener_db()
     try:
-        # Obtenemos las reglas y los pedidos
-        reglas_calendario = obtener_reglas_calendario(session)
-        df_pedidos = obtener_pedidos_para_programar(session)
+        reglas_calendario = obtener_reglas_calendario(db)
         
+        # 1. Obtener SOLO lo que NO tiene fecha (Pedidos Nuevos)
+        df_pedidos = obtener_pedidos_para_programar(db)
+        
+        # 2. Ejecutar motor (Pasamos df vacio si no hay nuevos, solo para recalcular reporte)
+        actualizaciones, capacidad_usada, dias_rep, fecha_post = ejecutar_motor_programacion(db, df_pedidos, reglas_calendario)
+            
+        # 3. Guardar fechas de pedidos nuevos
         if not df_pedidos.empty:
-            # Corremos el motor
-            actualizaciones, capacidad_usada, dias_rep, fecha_post = ejecutar_motor_programacion(session, df_pedidos, reglas_calendario)
-            
-            # Actualizamos la BD con los resultados
-            actualizar_base_datos(session, actualizaciones)
-            
-            # Recalculamos el reporte de capacidad
-            actualizar_reporte_capacidad(session, reglas_calendario, capacidad_usada, dias_rep, fecha_post)
-            
-        else:
-            logging.info("No se encontraron pedidos nuevos para programar. Limpiando reporte antiguo.")
-            session.execute(text("TRUNCATE TABLE reporte_capacidad_diaria"))
-            
-        # Si todo salió bien, confirmamos los cambios
-        session.commit()
-        logging.info("¡Motor de Programación finalizado con éxito! Cambios guardados.")
+            actualizar_base_datos(db, actualizaciones)
         
+        # 4. Regenerar reporte final
+        actualizar_reporte_capacidad(db, reglas_calendario, capacidad_usada, dias_rep, fecha_post)
+            
+        logging.info("¡Scheduler finalizado!")
     except Exception as e:
-        # Si algo falla, revertimos todo
-        logging.error(f"¡Error! Revertiendo cambios... Detalle: {e}")
-        session.rollback()
-    finally:
-        # Cerramos la sesión
-        session.close()
-        
-    logging.info("--- Motor de Programación Finalizado ---")
-
+        logging.error(f"¡Error crítico!: {e}")
 
 if __name__ == "__main__":
     main()
